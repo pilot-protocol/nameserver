@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -174,20 +175,23 @@ type recordSnapshot struct {
 }
 
 type snapshotA struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
+	Name      string    `json:"name"`
+	Address   string    `json:"address"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type snapshotN struct {
-	Name      string `json:"name"`
-	NetworkID uint16 `json:"network_id"`
+	Name      string    `json:"name"`
+	NetworkID uint16    `json:"network_id"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type snapshotS struct {
-	Name      string `json:"name"`
-	Address   string `json:"address"`
-	NetworkID uint16 `json:"network_id"`
-	Port      uint16 `json:"port"`
+	Name      string    `json:"name"`
+	Address   string    `json:"address"`
+	NetworkID uint16    `json:"network_id"`
+	Port      uint16    `json:"port"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 func (rs *RecordStore) save() {
@@ -197,10 +201,10 @@ func (rs *RecordStore) save() {
 
 	snap := recordSnapshot{}
 	for name, e := range rs.aRecords {
-		snap.ARecords = append(snap.ARecords, snapshotA{Name: name, Address: e.Addr.String()})
+		snap.ARecords = append(snap.ARecords, snapshotA{Name: name, Address: e.Addr.String(), CreatedAt: e.CreatedAt})
 	}
 	for name, e := range rs.nRecords {
-		snap.NRecords = append(snap.NRecords, snapshotN{Name: name, NetworkID: e.NetID})
+		snap.NRecords = append(snap.NRecords, snapshotN{Name: name, NetworkID: e.NetID, CreatedAt: e.CreatedAt})
 	}
 	for key, entries := range rs.sRecords {
 		for _, e := range entries {
@@ -209,6 +213,7 @@ func (rs *RecordStore) save() {
 				Address:   e.Address.String(),
 				NetworkID: key.NetworkID,
 				Port:      e.Port,
+				CreatedAt: e.CreatedAt,
 			})
 		}
 	}
@@ -248,15 +253,27 @@ func (rs *RecordStore) load() {
 		return
 	}
 
+	// Preserve original CreatedAt across restarts so the TTL reaper
+	// sees the true age of each record. Older snapshot formats (pre
+	// 2026-05-26) didn't persist CreatedAt; fall back to time.Now() for
+	// those so the daemon doesn't reap every loaded record on the first
+	// post-upgrade tick.
+	now := time.Now()
+	restore := func(t time.Time) time.Time {
+		if t.IsZero() {
+			return now
+		}
+		return t
+	}
 	for _, a := range snap.ARecords {
 		addr, err := protocol.ParseAddr(a.Address)
 		if err != nil {
 			continue
 		}
-		rs.aRecords[a.Name] = &aEntry{Addr: addr, CreatedAt: time.Now()}
+		rs.aRecords[normalizeName(a.Name)] = &aEntry{Addr: addr, CreatedAt: restore(a.CreatedAt)}
 	}
 	for _, n := range snap.NRecords {
-		rs.nRecords[n.Name] = &nEntry{NetID: n.NetworkID, CreatedAt: time.Now()}
+		rs.nRecords[normalizeName(n.Name)] = &nEntry{NetID: n.NetworkID, CreatedAt: restore(n.CreatedAt)}
 	}
 	for _, s := range snap.SRecords {
 		addr, err := protocol.ParseAddr(s.Address)
@@ -265,17 +282,28 @@ func (rs *RecordStore) load() {
 		}
 		key := svcKey{NetworkID: s.NetworkID, Port: s.Port}
 		rs.sRecords[key] = append(rs.sRecords[key], ServiceEntry{
-			Name:      s.Name,
+			Name:      normalizeName(s.Name),
 			Address:   addr,
 			Port:      s.Port,
-			CreatedAt: time.Now(),
+			CreatedAt: restore(s.CreatedAt),
 		})
 	}
 	slog.Info("loaded nameserver state", "a_records", len(rs.aRecords), "n_records", len(rs.nRecords))
 }
 
+// normalizeName folds hostnames to lowercase so the store is case-
+// insensitive (DNS convention). All Register/Lookup/Unregister paths
+// must funnel name input through this so map keys are canonical.
+// Snapshot keys read off disk are also normalized in load() for
+// backwards-compat with pre-2026-05-26 stores that may contain mixed-
+// case entries.
+func normalizeName(name string) string {
+	return strings.ToLower(name)
+}
+
 // RegisterA adds or updates an A record (name → address).
 func (rs *RecordStore) RegisterA(name string, addr protocol.Addr) {
+	name = normalizeName(name)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.aRecords[name] = &aEntry{Addr: addr, CreatedAt: time.Now()}
@@ -284,6 +312,7 @@ func (rs *RecordStore) RegisterA(name string, addr protocol.Addr) {
 
 // LookupA resolves a name to an address.
 func (rs *RecordStore) LookupA(name string) (protocol.Addr, error) {
+	name = normalizeName(name)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	e, ok := rs.aRecords[name]
@@ -295,6 +324,7 @@ func (rs *RecordStore) LookupA(name string) (protocol.Addr, error) {
 
 // RegisterN adds a network name record.
 func (rs *RecordStore) RegisterN(name string, netID uint16) {
+	name = normalizeName(name)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.nRecords[name] = &nEntry{NetID: netID, CreatedAt: time.Now()}
@@ -303,6 +333,7 @@ func (rs *RecordStore) RegisterN(name string, netID uint16) {
 
 // LookupN resolves a network name to a network ID.
 func (rs *RecordStore) LookupN(name string) (uint16, error) {
+	name = normalizeName(name)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	e, ok := rs.nRecords[name]
@@ -314,13 +345,19 @@ func (rs *RecordStore) LookupN(name string) (uint16, error) {
 
 // RegisterS registers a service provider.
 func (rs *RecordStore) RegisterS(name string, addr protocol.Addr, networkID, port uint16) {
+	name = normalizeName(name)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	key := svcKey{NetworkID: networkID, Port: port}
 	entry := ServiceEntry{Name: name, Address: addr, Port: port, CreatedAt: time.Now()}
-	// Avoid duplicates — refresh TTL if already present
+	// Avoid duplicates — refresh TTL if already present. Also update
+	// Name in case the same (addr, port) was re-registered under a
+	// different name (e.g. an operator rolls "cache" → "redis"); the
+	// most-recent registration wins instead of letting the stale name
+	// haunt every LookupS result until the TTL expires.
 	for i, e := range rs.sRecords[key] {
 		if e.Address == addr && e.Port == port {
+			rs.sRecords[key][i].Name = name
 			rs.sRecords[key][i].CreatedAt = time.Now()
 			return
 		}
@@ -341,6 +378,7 @@ func (rs *RecordStore) LookupS(networkID, port uint16) []ServiceEntry {
 
 // UnregisterA removes an A record.
 func (rs *RecordStore) UnregisterA(name string) {
+	name = normalizeName(name)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	delete(rs.aRecords, name)
