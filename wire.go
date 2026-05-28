@@ -150,11 +150,10 @@ func FormatRequest(r Request) string {
 
 // ParseResponse parses a plain-text nameserver response.
 func ParseResponse(text string) (Response, error) {
+	// strings.Split always returns at least one element, so the
+	// "empty response" guard would be unreachable; the real empty
+	// case is caught by the len(fields) < 1 check below.
 	lines := strings.Split(strings.TrimSpace(text), "\n")
-	if len(lines) == 0 {
-		return Response{}, fmt.Errorf("empty response")
-	}
-
 	first := strings.TrimSpace(lines[0])
 	if first == "OK" {
 		return Response{Type: "OK"}, nil
