@@ -5,7 +5,7 @@ package nameserver_test
 import (
 	"testing"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/nameserver"
 )
 

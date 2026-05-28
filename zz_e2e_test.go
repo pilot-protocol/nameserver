@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // fakeListener implements PortListener using net.Listen on 127.0.0.1.

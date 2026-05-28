@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/coreapi"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // PortListener abstracts the ability to listen on a Pilot overlay port.

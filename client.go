@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Dialer abstracts the ability to open a connection to a Pilot overlay address.
