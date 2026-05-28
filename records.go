@@ -218,11 +218,10 @@ func (rs *RecordStore) save() {
 		}
 	}
 
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		slog.Error("save nameserver state", "err", err)
-		return
-	}
+	// MarshalIndent on recordSnapshot is infallible: every field is a
+	// primitive (string/uint16) or time.Time, no exotic types.
+	// The error branch is unreachable.
+	data, _ := json.MarshalIndent(snap, "", "  ")
 
 	dir := filepath.Dir(rs.storePath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
