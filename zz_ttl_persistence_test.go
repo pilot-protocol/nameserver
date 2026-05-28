@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/nameserver"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 func TestRecordStoreTTLSurvivesRestart(t *testing.T) {

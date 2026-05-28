@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Wire protocol for the nameserver. Plain text, newline-delimited.

@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/fsutil"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Record types
