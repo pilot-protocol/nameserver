@@ -23,6 +23,12 @@ const (
 	RecordS = "S" // Service discovery
 )
 
+// MaxNameLength is the maximum length of a name accepted by Register.
+// DNS labels are limited to 63 octets; a full name (including dots)
+// is limited to 255 octets total. We use 253 — the RFC 1035 maximum
+// — as the per-name cap to constrain memory DoS via huge names.
+const MaxNameLength = 253
+
 // Record is a name record in the nameserver.
 type Record struct {
 	Type    string `json:"type"`
