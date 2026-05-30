@@ -58,6 +58,15 @@ func ParseRequest(line string) (Request, error) {
 	cmd := strings.ToUpper(fields[0])
 	rt := strings.ToUpper(fields[1])
 
+	// Cap fields to the maximum valid count for each command+type.
+	// This prevents unbounded allocation from strings.Fields on
+	// pathological input (in-process protection; the transport layer
+	// caps message size independently).
+	maxFields := maxRequestFieldsFor(cmd, rt)
+	if maxFields > 0 && len(fields) > maxFields {
+		return Request{}, fmt.Errorf("too many fields (%d > %d)", len(fields), maxFields)
+	}
+
 	switch cmd {
 	case "QUERY":
 		switch rt {
@@ -123,6 +132,36 @@ func ParseRequest(line string) (Request, error) {
 
 	default:
 		return Request{}, fmt.Errorf("unknown command: %s", cmd)
+	}
+}
+
+// maxRequestFieldsFor returns the maximum number of whitespace-separated
+// fields that are valid for the given command and record type. Returns 0
+// for unknown commands/types (which will be rejected later by the switch).
+func maxRequestFieldsFor(cmd, rt string) int {
+	switch cmd {
+	case "QUERY":
+		switch rt {
+		case "A", "N":
+			return 3 // QUERY A/N <name>
+		case "S":
+			return 4 // QUERY S <net_id> <port>
+		default:
+			return 3 // unknown type, at most "QUERY X ..."
+		}
+	case "REGISTER":
+		switch rt {
+		case "A":
+			return 4 // REGISTER A <name> <address>
+		case "N":
+			return 4 // REGISTER N <name> <net_id>
+		case "S":
+			return 6 // REGISTER S <name> <address> <net_id> <port>
+		default:
+			return 3 // unknown type, at most "REGISTER X ..."
+		}
+	default:
+		return 0 // unknown command, check happens later
 	}
 }
 

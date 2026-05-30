@@ -146,13 +146,19 @@ func TestParseRequestUnknownRecordType(t *testing.T) {
 
 func TestParseRequestExtraFields(t *testing.T) {
 	t.Parallel()
-	// Extra fields should be ignored (or at least not crash)
-	req, err := nameserver.ParseRequest("QUERY A myhost extra1 extra2")
-	if err != nil {
-		t.Fatalf("ParseRequest with extra fields: %v", err)
+	// Extra fields exceeding max for the command/type should be rejected.
+	cases := []string{
+		"QUERY A myhost extra1",                     // 4 fields, QUERY A max=3
+		"QUERY N mynet extra",                        // 4 fields, QUERY N max=3
+		"QUERY S 1 80 extra",                         // 5 fields, QUERY S max=4
+		"REGISTER A myhost 0:1 extra",                // 5 fields, REGISTER A max=4
+		"REGISTER N mynet 1 extra",                   // 5 fields, REGISTER N max=4
+		"REGISTER S svc 0:1 1 80 extra",              // 7 fields, REGISTER S max=6
 	}
-	if req.Name != "myhost" {
-		t.Fatalf("expected name 'myhost', got %q", req.Name)
+	for _, tc := range cases {
+		if _, err := nameserver.ParseRequest(tc); err == nil {
+			t.Errorf("ParseRequest(%q): expected error, got nil", tc)
+		}
 	}
 }
 
