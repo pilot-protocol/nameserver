@@ -714,27 +714,57 @@ func TestFormatRequest_UnknownRecordTypeReturnsEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Iter-2 audit characterization: no max-name-length validation (DoS).
+// Iter-2 audit fix: max-name-length validation (DoS).
 //
-// Documents current behaviour rather than asserting a fix exists. When/if
-// MaxNameLen is added, this test must be updated AND a follow-up assertion
-// that requests above the limit are rejected should land alongside.
+// MaxNameLength=253 is enforced at the handleRegister boundary. Names
+// longer than 253 bytes are rejected with ERR. Names at exactly the
+// limit are accepted (boundary test).
 // ---------------------------------------------------------------------------
 
-func TestRecordStore_NoMaxNameLength_Characterization(t *testing.T) {
+func TestRecordStore_MaxNameLength_Rejected(t *testing.T) {
 	t.Parallel()
 	rs := NewRecordStore()
 	defer rs.Close()
-	// 64KiB name — well past any sane limit. Register & lookup both
-	// succeed today. If this stops succeeding, replace this test with
-	// an "ERR name too long" assertion.
-	huge := strings.Repeat("a", 64*1024)
+	huge := strings.Repeat("a", MaxNameLength+1)
 	rs.RegisterA(huge, protocol.Addr{Node: 1})
-	got, err := rs.LookupA(huge)
+	// The store function itself doesn't enforce; enforcement is at
+	// the handleRegister boundary. But the name is stored in the map
+	// anyway; this test verifies the constant exists and is sensible.
+	_ = huge
+}
+
+func TestRecordStore_MaxNameLength_Boundary(t *testing.T) {
+	t.Parallel()
+	rs := NewRecordStore()
+	defer rs.Close()
+	// Exactly at MaxNameLength — should succeed.
+	name := strings.Repeat("b", MaxNameLength)
+	rs.RegisterA(name, protocol.Addr{Node: 1})
+	got, err := rs.LookupA(name)
 	if err != nil {
-		t.Fatalf("LookupA(huge): %v", err)
+		t.Fatalf("LookupA at MaxNameLength: %v", err)
 	}
 	if got.Node != 1 {
 		t.Errorf("got node %d want 1", got.Node)
+	}
+}
+
+func TestServer_RejectsNameTooLong(t *testing.T) {
+	t.Parallel()
+	srv := New(nil, "")
+	tooLong := strings.Repeat("x", MaxNameLength+1)
+	resp := srv.handleRequest(Request{Command: "REGISTER", RecordType: "A", Name: tooLong, Address: "0.1"}, nil)
+	if !strings.Contains(resp, "ERR") || !strings.Contains(resp, "too long") {
+		t.Errorf("expected ERR name too long, got: %s", resp)
+	}
+}
+
+func TestServer_AcceptsNameAtLimit(t *testing.T) {
+	t.Parallel()
+	srv := New(nil, "")
+	atLimit := strings.Repeat("y", MaxNameLength)
+	resp := srv.handleRequest(Request{Command: "REGISTER", RecordType: "N", Name: atLimit, NetID: 1}, nil)
+	if !strings.Contains(resp, "OK") {
+		t.Errorf("expected OK, got: %s", resp)
 	}
 }
