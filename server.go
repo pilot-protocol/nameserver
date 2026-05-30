@@ -144,6 +144,11 @@ func (s *Server) handleQuery(req Request) string {
 }
 
 func (s *Server) handleRegister(req Request, remoteAddr net.Addr) string {
+	// Reject excessively long names to prevent memory DoS.
+	if len(req.Name) > MaxNameLength {
+		return FormatResponseErr(fmt.Sprintf("name too long: %d bytes (max %d)", len(req.Name), MaxNameLength))
+	}
+
 	// Extract caller's node ID from RemoteAddr for source validation
 	callerNode := extractCallerNode(remoteAddr)
 
