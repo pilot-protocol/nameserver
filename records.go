@@ -49,8 +49,11 @@ type aEntry struct {
 }
 
 // nEntry wraps an N record with creation time for TTL expiry.
+// Owner is the node ID that registered the record, or 0 when the
+// registrant could not be identified.
 type nEntry struct {
 	NetID     uint16
+	Owner     uint32
 	CreatedAt time.Time
 }
 
@@ -63,6 +66,13 @@ type RecordStore struct {
 	storePath string                    // path to persist records (empty = no persistence)
 	ttl       time.Duration
 	done      chan struct{}
+	saveSeq   uint64 // guarded by mu; incremented once per snapshot
+
+	// writeMu serializes on-disk writes and guards writtenSeq. It is
+	// acquired only after mu has been released, so a file write never
+	// blocks readers of the in-memory maps.
+	writeMu    sync.Mutex
+	writtenSeq uint64
 }
 
 type svcKey struct {
@@ -115,7 +125,6 @@ func (rs *RecordStore) reapLoop() {
 
 func (rs *RecordStore) reapExpired() {
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
 
 	now := time.Now()
 	reaped := false
@@ -147,9 +156,13 @@ func (rs *RecordStore) reapExpired() {
 			rs.sRecords[key] = alive
 		}
 	}
+	var pending *pendingSave
 	if reaped {
-		rs.save()
+		pending = rs.snapshotLocked()
 	}
+	rs.mu.Unlock()
+
+	rs.writeSnapshot(pending)
 }
 
 // SetTTL overrides the default record TTL.
@@ -189,6 +202,7 @@ type snapshotA struct {
 type snapshotN struct {
 	Name      string    `json:"name"`
 	NetworkID uint16    `json:"network_id"`
+	NodeID    uint32    `json:"node_id,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
@@ -200,9 +214,23 @@ type snapshotS struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
-func (rs *RecordStore) save() {
+// pendingSave is a serialized store snapshot waiting to be written to
+// disk. It carries everything writeSnapshot needs so that no store field
+// has to be read while the write is in flight.
+type pendingSave struct {
+	path     string
+	data     []byte
+	seq      uint64
+	aRecords int
+	nRecords int
+}
+
+// snapshotLocked serializes the current records. The caller must hold mu
+// (at least for reading). It returns nil when persistence is disabled.
+// The returned snapshot is written by writeSnapshot after mu is released.
+func (rs *RecordStore) snapshotLocked() *pendingSave {
 	if rs.storePath == "" {
-		return
+		return nil
 	}
 
 	snap := recordSnapshot{}
@@ -210,7 +238,7 @@ func (rs *RecordStore) save() {
 		snap.ARecords = append(snap.ARecords, snapshotA{Name: name, Address: e.Addr.String(), CreatedAt: e.CreatedAt})
 	}
 	for name, e := range rs.nRecords {
-		snap.NRecords = append(snap.NRecords, snapshotN{Name: name, NetworkID: e.NetID, CreatedAt: e.CreatedAt})
+		snap.NRecords = append(snap.NRecords, snapshotN{Name: name, NetworkID: e.NetID, NodeID: e.Owner, CreatedAt: e.CreatedAt})
 	}
 	for key, entries := range rs.sRecords {
 		for _, e := range entries {
@@ -225,21 +253,52 @@ func (rs *RecordStore) save() {
 	}
 
 	// MarshalIndent on recordSnapshot is infallible: every field is a
-	// primitive (string/uint16) or time.Time, no exotic types.
+	// primitive (string/uint16/uint32) or time.Time, no exotic types.
 	// The error branch is unreachable.
 	data, _ := json.MarshalIndent(snap, "", "  ")
 
-	dir := filepath.Dir(rs.storePath)
+	rs.saveSeq++
+	return &pendingSave{
+		path:     rs.storePath,
+		data:     data,
+		seq:      rs.saveSeq,
+		aRecords: len(rs.aRecords),
+		nRecords: len(rs.nRecords),
+	}
+}
+
+// writeSnapshot persists a snapshot produced by snapshotLocked. It must
+// be called with mu released: the directory creation and the atomic file
+// write (which fsyncs) can take milliseconds, and holding mu across them
+// would stall every concurrent lookup.
+//
+// Concurrent writers are serialized on writeMu, and a snapshot older than
+// the last one written is dropped so the file always ends up holding the
+// most recent state.
+func (rs *RecordStore) writeSnapshot(p *pendingSave) {
+	if p == nil || p.path == "" {
+		return
+	}
+
+	rs.writeMu.Lock()
+	defer rs.writeMu.Unlock()
+
+	if p.seq <= rs.writtenSeq {
+		return
+	}
+
+	dir := filepath.Dir(p.path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		slog.Error("create nameserver state directory", "dir", dir, "err", err)
 		return
 	}
 
-	if err := fsutil.AtomicWrite(rs.storePath, data); err != nil {
+	if err := fsutil.AtomicWrite(p.path, p.data); err != nil {
 		slog.Error("write nameserver state", "err", err)
 		return
 	}
-	slog.Debug("nameserver state saved", "a_records", len(rs.aRecords), "n_records", len(rs.nRecords))
+	rs.writtenSeq = p.seq
+	slog.Debug("nameserver state saved", "a_records", p.aRecords, "n_records", p.nRecords)
 }
 
 func (rs *RecordStore) load() {
@@ -278,7 +337,7 @@ func (rs *RecordStore) load() {
 		rs.aRecords[normalizeName(a.Name)] = &aEntry{Addr: addr, CreatedAt: restore(a.CreatedAt)}
 	}
 	for _, n := range snap.NRecords {
-		rs.nRecords[normalizeName(n.Name)] = &nEntry{NetID: n.NetworkID, CreatedAt: restore(n.CreatedAt)}
+		rs.nRecords[normalizeName(n.Name)] = &nEntry{NetID: n.NetworkID, Owner: n.NodeID, CreatedAt: restore(n.CreatedAt)}
 	}
 	for _, s := range snap.SRecords {
 		addr, err := protocol.ParseAddr(s.Address)
@@ -310,9 +369,11 @@ func normalizeName(name string) string {
 func (rs *RecordStore) RegisterA(name string, addr protocol.Addr) {
 	name = normalizeName(name)
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
 	rs.aRecords[name] = &aEntry{Addr: addr, CreatedAt: time.Now()}
-	rs.save()
+	pending := rs.snapshotLocked()
+	rs.mu.Unlock()
+
+	rs.writeSnapshot(pending)
 }
 
 // LookupA resolves a name to an address.
@@ -327,13 +388,32 @@ func (rs *RecordStore) LookupA(name string) (protocol.Addr, error) {
 	return e.Addr, nil
 }
 
-// RegisterN adds a network name record.
+// RegisterN adds a network name record with no recorded owner.
 func (rs *RecordStore) RegisterN(name string, netID uint16) {
+	rs.RegisterNOwned(name, netID, 0, false)
+}
+
+// RegisterNOwned adds a network name record and records owner as the
+// node that registered it (0 means the registrant is unknown).
+//
+// When enforce is true and the name already carries a different non-zero
+// owner, the record is left untouched and false is returned. With enforce
+// false the record is overwritten unconditionally and true is returned.
+func (rs *RecordStore) RegisterNOwned(name string, netID uint16, owner uint32, enforce bool) bool {
 	name = normalizeName(name)
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	rs.nRecords[name] = &nEntry{NetID: netID, CreatedAt: time.Now()}
-	rs.save()
+	if enforce {
+		if cur, ok := rs.nRecords[name]; ok && cur.Owner != 0 && cur.Owner != owner {
+			rs.mu.Unlock()
+			return false
+		}
+	}
+	rs.nRecords[name] = &nEntry{NetID: netID, Owner: owner, CreatedAt: time.Now()}
+	pending := rs.snapshotLocked()
+	rs.mu.Unlock()
+
+	rs.writeSnapshot(pending)
+	return true
 }
 
 // LookupN resolves a network name to a network ID.
@@ -352,7 +432,6 @@ func (rs *RecordStore) LookupN(name string) (uint16, error) {
 func (rs *RecordStore) RegisterS(name string, addr protocol.Addr, networkID, port uint16) {
 	name = normalizeName(name)
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
 	key := svcKey{NetworkID: networkID, Port: port}
 	entry := ServiceEntry{Name: name, Address: addr, Port: port, CreatedAt: time.Now()}
 	// Avoid duplicates — refresh TTL if already present. Also update
@@ -364,11 +443,15 @@ func (rs *RecordStore) RegisterS(name string, addr protocol.Addr, networkID, por
 		if e.Address == addr && e.Port == port {
 			rs.sRecords[key][i].Name = name
 			rs.sRecords[key][i].CreatedAt = time.Now()
+			rs.mu.Unlock()
 			return
 		}
 	}
 	rs.sRecords[key] = append(rs.sRecords[key], entry)
-	rs.save()
+	pending := rs.snapshotLocked()
+	rs.mu.Unlock()
+
+	rs.writeSnapshot(pending)
 }
 
 // LookupS finds service providers on a network+port.
@@ -385,9 +468,11 @@ func (rs *RecordStore) LookupS(networkID, port uint16) []ServiceEntry {
 func (rs *RecordStore) UnregisterA(name string) {
 	name = normalizeName(name)
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
 	delete(rs.aRecords, name)
-	rs.save()
+	pending := rs.snapshotLocked()
+	rs.mu.Unlock()
+
+	rs.writeSnapshot(pending)
 }
 
 // AllA returns all A records.
