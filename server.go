@@ -6,10 +6,27 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strings"
+	"sync/atomic"
 
 	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/common/protocol"
 )
+
+// StrictRegisterEnv names the environment variable that turns on strict
+// REGISTER handling. It is off unless the value is "1" or "true".
+//
+// With strict handling on:
+//   - every REGISTER must arrive on a connection whose remote address
+//     resolves to a non-zero node ID;
+//   - N records are bound to the node that registered them, and a later
+//     REGISTER N for the same name from a different node is refused.
+//
+// With it off (the default) the server keeps its previous behaviour:
+// unresolvable callers are accepted and N records may be overwritten by
+// any caller.
+const StrictRegisterEnv = "PILOT_NAMESERVER_STRICT_REGISTER"
 
 // PortListener abstracts the ability to listen on a Pilot overlay port.
 // Satisfied by *driver.Driver (via a thin wrapper in cmd/nameserver).
@@ -29,6 +46,7 @@ type Server struct {
 	listener PortListener
 	ln       net.Listener
 	ready    chan struct{}
+	strict   atomic.Bool
 }
 
 // New creates a nameserver backed by a fresh record store.
@@ -38,12 +56,32 @@ func New(pl PortListener, storePath string) *Server {
 	if storePath != "" {
 		store.SetStorePath(storePath)
 	}
-	return &Server{
+	s := &Server{
 		store:    store,
 		listener: pl,
 		ready:    make(chan struct{}),
 	}
+	s.strict.Store(strictRegisterFromEnv())
+	return s
 }
+
+// strictRegisterFromEnv reads StrictRegisterEnv. Anything other than
+// "1"/"true" (case-insensitive) leaves strict handling off.
+func strictRegisterFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(StrictRegisterEnv))) {
+	case "1", "true":
+		return true
+	default:
+		return false
+	}
+}
+
+// SetStrictRegister turns strict REGISTER handling on or off at runtime,
+// overriding whatever StrictRegisterEnv selected at construction.
+func (s *Server) SetStrictRegister(on bool) { s.strict.Store(on) }
+
+// StrictRegister reports whether strict REGISTER handling is on.
+func (s *Server) StrictRegister() bool { return s.strict.Load() }
 
 // Ready returns a channel that is closed once the server is listening.
 func (s *Server) Ready() <-chan struct{} {
@@ -149,8 +187,17 @@ func (s *Server) handleRegister(req Request, remoteAddr net.Addr) string {
 		return FormatResponseErr(fmt.Sprintf("name too long: %d bytes (max %d)", len(req.Name), MaxNameLength))
 	}
 
-	// Extract caller's node ID from RemoteAddr for source validation
+	strict := s.strict.Load()
+
+	// Extract caller's node ID from RemoteAddr for source validation.
 	callerNode := extractCallerNode(remoteAddr)
+	if strict {
+		node, ok := resolveCallerNode(remoteAddr)
+		if !ok {
+			return FormatResponseErr("caller node identity required")
+		}
+		callerNode = node
+	}
 
 	switch req.RecordType {
 	case RecordA:
@@ -167,8 +214,12 @@ func (s *Server) handleRegister(req Request, remoteAddr net.Addr) string {
 		return FormatResponseOK()
 
 	case RecordN:
-		s.store.RegisterN(req.Name, req.NetID)
-		slog.Debug("nameserver registered N record", "name", req.Name, "network_id", req.NetID)
+		// The owning node is always recorded; it is only enforced against
+		// a later registrant when strict handling is on.
+		if !s.store.RegisterNOwned(req.Name, req.NetID, callerNode, strict) {
+			return FormatResponseErr("network name registered by another node")
+		}
+		slog.Debug("nameserver registered N record", "name", req.Name, "network_id", req.NetID, "node", callerNode)
 		return FormatResponseOK()
 
 	case RecordS:
@@ -207,4 +258,46 @@ func extractCallerNode(addr net.Addr) uint32 {
 		return 0
 	}
 	return pilotAddr.Node
+}
+
+// resolveCallerNode returns the node ID carried by a remote address, and
+// whether one could be determined at all.
+//
+// A Pilot address renders as "<network>:<hex>.<hex>.<hex>", so the
+// "<address>:<port>" string reported by the overlay connection adapter
+// contains two colons and is not a host:port pair net.SplitHostPort can
+// split. Each plausible substring is tried in turn: the whole string, the
+// host part when the string really is host:port (the bracketed form), and
+// the string with a trailing ":<port>" removed.
+//
+// A node ID of 0 is reported as unresolved: it is the zero value used
+// throughout this package to mean "no caller identity".
+func resolveCallerNode(addr net.Addr) (uint32, bool) {
+	if addr == nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(addr.String())
+	if s == "" {
+		return 0, false
+	}
+
+	candidates := []string{s}
+	if host, _, err := net.SplitHostPort(s); err == nil && host != "" {
+		candidates = append(candidates, host)
+	}
+	if i := strings.LastIndex(s, ":"); i > 0 {
+		candidates = append(candidates, s[:i])
+	}
+
+	for _, c := range candidates {
+		pilotAddr, err := protocol.ParseAddr(c)
+		if err != nil {
+			continue
+		}
+		if pilotAddr.Node == 0 {
+			return 0, false
+		}
+		return pilotAddr.Node, true
+	}
+	return 0, false
 }
